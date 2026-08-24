@@ -1,0 +1,263 @@
+# ViewSonic PJD7820HD (VS14937) control via RS-232
+# Protocol: 115200 8N1, no flow control (User Guide p.66)
+# Frame format: byte[0] + 4 == total length; last byte == sum(bytes[1..n-2]) & 0xFF
+#
+# HARDWARE NOTE: the projector's DB9 is true RS-232 (+/-12V). A MAX3232-class
+# level shifter between it and the ESP8266 is mandatory. TX->RX, RX->TX, GND-GND.
+#
+# ENTITY IDs: the node name and the five original entity names are byte-for-byte
+# unchanged from the running firmware, so every existing entity_id survives this
+# update. Do not "tidy" the name: fields below - that is what would break them.
+# No friendly_name: key either; adding one changes how ESPHome prefixes IDs.
+
+esphome:
+  name: viewsonic_projector
+
+esp8266:
+  board: nodemcuv2
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none      # ESP8266 modem sleep causes dropped API connections
+  fast_connect: true
+  ap:
+    ssid: "Projector Fallback Hotspot"
+    password: !secret projector_ap_password
+
+captive_portal:
+
+logger:
+  baud_rate: 0               # UART0 belongs to the projector; logs go over WiFi
+
+api:
+  encryption:
+    key: !secret projector_api_key
+  # Don't reboot just because HA restarted - a reboot costs us projector state.
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret projector_ota_password
+
+uart:
+  id: uart_bus
+  tx_pin: GPIO1
+  rx_pin: GPIO3
+  baud_rate: 115200
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 256
+  on_uart_data:
+    # Stream parser. Replies carry no query id, so `pending` tells us what
+    # this value actually means. See the query_* scripts below.
+    then:
+      - lambda: |-
+          static std::vector<uint8_t> buf;
+          for (uint8_t b : x) {
+            // Resync: a valid frame always starts with a plausible length byte.
+            if (buf.empty() && (b < 0x03 || b > 0x20)) continue;
+            buf.push_back(b);
+
+            size_t need = (size_t) buf[0] + 4;
+            if (buf.size() < need) continue;
+
+            uint8_t sum = 0;
+            for (size_t i = 1; i < need - 1; i++) sum += buf[i];
+
+            if (sum == buf[need - 1] && buf[1] == 0x14) {
+              // Payload is everything between the header and the checksum.
+              uint32_t value = 0;
+              for (size_t i = 4; i < need - 1; i++) value = (value << 8) | buf[i];
+
+              id(last_reply) = millis();
+              switch (id(pending)) {
+                case 1:  // power
+                  id(proj_status).publish_state(value == 1);
+                  id(proj_power).publish_state(value == 1);
+                  break;
+                case 2:  // source input
+                  switch (value) {
+                    case 0x00: id(proj_source).publish_state("VGA");       break;
+                    case 0x08: id(proj_source).publish_state("VGA2");      break;
+                    case 0x03: id(proj_source).publish_state("HDMI");      break;
+                    case 0x05: id(proj_source).publish_state("Composite"); break;
+                    case 0x06: id(proj_source).publish_state("S-Video");   break;
+                  }
+                  break;
+                case 3:  // lamp hours
+                  id(proj_lamp_hours).publish_state(value);
+                  break;
+                case 4:  // lamp mode
+                  id(proj_lamp_mode).publish_state(value == 1 ? "Economic" : "Normal");
+                  break;
+              }
+              id(pending) = 0;
+            }
+            buf.clear();
+          }
+
+globals:
+  - id: pending
+    type: uint8_t
+    restore_value: false
+    initial_value: "0"
+  - id: last_reply
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+script:
+  - id: query_power
+    mode: restart
+    then:
+      - lambda: "id(pending) = 1;"
+      - uart.write: [0x07, 0x14, 0x00, 0x05, 0x00, 0x34, 0x00, 0x00, 0x11, 0x00, 0x5E]
+  - id: query_source
+    mode: restart
+    then:
+      - lambda: "id(pending) = 2;"
+      - uart.write: [0x07, 0x14, 0x00, 0x05, 0x00, 0x34, 0x00, 0x00, 0x13, 0x01, 0x61]
+  - id: query_lamp_hours
+    mode: restart
+    then:
+      - lambda: "id(pending) = 3;"
+      - uart.write: [0x07, 0x14, 0x00, 0x05, 0x00, 0x34, 0x00, 0x00, 0x15, 0x01, 0x63]
+  - id: query_lamp_mode
+    mode: restart
+    then:
+      - lambda: "id(pending) = 4;"
+      - uart.write: [0x07, 0x14, 0x00, 0x05, 0x00, 0x34, 0x00, 0x00, 0x11, 0x10, 0x6E]
+
+interval:
+  - interval: 5s
+    then:
+      - script.execute: query_power
+  # Staggered so each reply lands before the next query goes out.
+  - interval: 5min
+    then:
+      - delay: 1s
+      - script.execute: query_source
+      - delay: 1s
+      - script.execute: query_lamp_hours
+      - delay: 1s
+      - script.execute: query_lamp_mode
+
+switch:
+  # UNCHANGED NAME -> stays switch.projector_power
+  - platform: template
+    name: "Projector Power"
+    id: proj_power
+    icon: mdi:projector
+    restore_mode: DISABLED     # CRITICAL: stops a reboot from powering the projector off
+    optimistic: false          # state comes from the projector, not from us
+    turn_on_action:
+      - uart.write: [0x06, 0x14, 0x00, 0x04, 0x00, 0x34, 0x11, 0x00, 0x00, 0x5D]
+      - delay: 3s              # warm-up; projector ignores traffic while striking the lamp
+      - script.execute: query_power
+    turn_off_action:
+      - uart.write: [0x06, 0x14, 0x00, 0x04, 0x00, 0x34, 0x11, 0x01, 0x00, 0x5E]
+      - delay: 3s
+      - script.execute: query_power
+
+  - platform: template
+    name: "Projector Blank"
+    id: proj_blank
+    icon: mdi:monitor-off
+    restore_mode: DISABLED
+    optimistic: true
+    turn_on_action:
+      - uart.write: [0x06, 0x14, 0x00, 0x04, 0x00, 0x34, 0x12, 0x09, 0x01, 0x68]
+    turn_off_action:
+      - uart.write: [0x06, 0x14, 0x00, 0x04, 0x00, 0x34, 0x12, 0x09, 0x00, 0x67]
+
+binary_sensor:
+  # UNCHANGED NAME -> stays binary_sensor.projector_power_status
+  - platform: template
+    name: "Projector Power Status"
+    id: proj_status
+    device_class: power
+
+  - platform: template
+    name: "Projector Responding"
+    id: proj_link
+    device_class: connectivity
+    update_interval: 10s
+    lambda: |-
+      return id(last_reply) != 0 && (millis() - id(last_reply)) < 30000;
+
+select:
+  - platform: template
+    name: "Projector Source"
+    id: proj_source
+    icon: mdi:video-input-hdmi
+    optimistic: false
+    options: ["VGA", "VGA2", "HDMI", "Composite", "S-Video"]
+    set_action:
+      - lambda: |-
+          uint8_t code = 0x00;
+          if      (x == "VGA2")      code = 0x08;
+          else if (x == "HDMI")      code = 0x03;
+          else if (x == "Composite") code = 0x05;
+          else if (x == "S-Video")   code = 0x06;
+          uint8_t cmd[10] = {0x06, 0x14, 0x00, 0x04, 0x00, 0x34, 0x13, 0x01, code, 0};
+          uint8_t sum = 0;
+          for (int i = 1; i < 9; i++) sum += cmd[i];
+          cmd[9] = sum;
+          id(uart_bus).write_array(cmd, 10);
+      - delay: 1s
+      - script.execute: query_source
+
+  - platform: template
+    name: "Projector Lamp Mode"
+    id: proj_lamp_mode
+    icon: mdi:lightbulb-on-outline
+    optimistic: false
+    options: ["Normal", "Economic"]
+    set_action:
+      - uart.write: !lambda |-
+          if (x == "Economic")
+            return {0x06, 0x14, 0x00, 0x04, 0x00, 0x34, 0x11, 0x10, 0x01, 0x6E};
+          return {0x06, 0x14, 0x00, 0x04, 0x00, 0x34, 0x11, 0x10, 0x00, 0x6D};
+      - delay: 1s
+      - script.execute: query_lamp_mode
+
+sensor:
+  - platform: template
+    name: "Projector Lamp Hours"
+    id: proj_lamp_hours
+    unit_of_measurement: "h"
+    icon: mdi:lightbulb-alert
+    state_class: total_increasing
+    accuracy_decimals: 0
+
+  # UNCHANGED NAME -> stays sensor.projector_controller_wifi_signal
+  - platform: wifi_signal
+    name: "Projector Controller WiFi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Projector Controller Uptime"
+    entity_category: diagnostic
+
+text_sensor:
+  # UNCHANGED NAME -> stays sensor.projector_controller_ip_address
+  - platform: wifi_info
+    ip_address:
+      name: "Projector Controller IP Address"
+      entity_category: diagnostic
+
+button:
+  # UNCHANGED NAME -> stays button.restart_projector_controller
+  - platform: restart
+    name: "Restart Projector Controller"
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Projector Auto Adjust"
+    icon: mdi:auto-fix
+    entity_category: config
+    on_press:
+      - uart.write: [0x06, 0x14, 0x00, 0x04, 0x00, 0x34, 0x12, 0x05, 0x00, 0x63]

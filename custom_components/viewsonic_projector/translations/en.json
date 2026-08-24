@@ -1,0 +1,40 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "ViewSonic Projector",
+        "description": "Enter the address of the ESPHome serial bridge attached to the projector's RS-232 port.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "name": "Name"
+        },
+        "data_description": {
+          "host": "IP address or hostname of the ESPHome bridge node.",
+          "port": "TCP port configured under stream_server on the bridge.",
+          "name": "Name for the projector device in Home Assistant."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach the bridge, or the projector did not answer. Check that the bridge is online, that the projector is plugged into mains power, and that TX/RX are not swapped."
+    },
+    "abort": {
+      "already_configured": "This projector is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Polling",
+        "description": "Power is read every cycle. Other settings rotate through a queue a few per cycle, so a full refresh takes roughly ten cycles.",
+        "data": {
+          "scan_interval": "Seconds between polls"
+        },
+        "data_description": {
+          "scan_interval": "Lower is more responsive but puts more traffic on the serial line. 3 seconds suits most setups."
+        }
+      }
+    }
+  }
+}

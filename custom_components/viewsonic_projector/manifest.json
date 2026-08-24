@@ -1,0 +1,12 @@
+{
+  "domain": "viewsonic_projector",
+  "name": "ViewSonic Projector",
+  "codeowners": ["@Payton1394"],
+  "config_flow": true,
+  "documentation": "https://github.com/Payton1394/ha-viewsonic-projector",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/Payton1394/ha-viewsonic-projector/issues",
+  "requirements": [],
+  "version": "2.1.0"
+}
