@@ -2,9 +2,18 @@
 
 The projector speaks RS-232; an ESPHome node running ``stream_server`` bridges
 that line onto TCP. Because a read reply carries no indication of which query it
-answers, every exchange is serialised behind a lock and the receive buffer is
-cleared immediately before each request, so a late reply from a timed-out query
-is discarded rather than mistaken for the next answer.
+answers, every exchange is serialised behind a lock, and everything already on
+the line is thrown away immediately before each request -- our own buffer and
+whatever is still waiting in the socket -- so a late reply from a timed-out
+query is discarded rather than mistaken for the next answer. Clearing only our
+own buffer was not enough: a late reply sitting in the StreamReader was read as
+the next query's answer, which showed as the power switch flipping on and off
+and selects reporting codes that belong to other controls. A single-byte
+control also refuses a wider frame, which can only be another query's reply.
+
+A missed or refused power reply keeps the last known state; only several in a
+row mark the projector unavailable. And a power change is published once two
+reads in a row agree.
 
 Responsiveness comes from four things:
 
@@ -43,9 +52,13 @@ from .const import (
     KEY_ERROR_STATUS,
     POWER,
     POWER_CONFIRM_SETTLE,
+    POWER_MISSES_ALLOWED,
     REARM_AFTER,
     REPLY_TIMEOUT,
+    SINGLE_BYTE_PAYLOAD,
     SLOW_READS_PER_CYCLE,
+    STALE_QUIET,
+    STALE_QUIET_AFTER_MISS,
     WRITE_CONFIRM,
     Control,
     Kind,
@@ -92,6 +105,9 @@ class ViewSonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._refused: set[str] = set()
         self._rearm_at: float = 0.0
         self._last_power: bool | None = None
+        self._power_pending: bool | None = None
+        self._power_misses = 0
+        self._line_dirty = False
         self._power_assumed: bool | None = None
         self._power_grace_until: float = 0.0
 
@@ -125,31 +141,62 @@ class ViewSonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Low-level exchange -- callers must hold the lock
     # ------------------------------------------------------------------
 
-    async def _exchange(self, group: int, cmd: int) -> Reply:
-        """Send a read query and return the projector's frame."""
+    async def _drain_stale(self) -> None:
+        """Throw away everything already on the line, ours and the socket's.
+
+        Waits until the line has been quiet for STALE_QUIET -- longer after a
+        query went unanswered, whose reply may still be on its way -- so a
+        reply arriving from an earlier query goes too.
+        """
+        assert self._reader is not None
+        self._buffer.clear()
+        quiet = STALE_QUIET_AFTER_MISS if self._line_dirty else STALE_QUIET
+        self._line_dirty = False
+        while True:
+            try:
+                chunk = await asyncio.wait_for(self._reader.read(256), timeout=quiet)
+            except TimeoutError:
+                return
+            if not chunk:
+                raise ConnectionError("bridge closed the connection")
+            _LOGGER.debug("Discarded %d stale bytes: %s", len(chunk), chunk.hex(" "))
+
+    async def _exchange(self, group: int, cmd: int, payload_len: int | None = None) -> Reply:
+        """Send a read query and return the projector's frame.
+
+        With ``payload_len``, an answer of another width is somebody else's
+        late reply: it is dropped and the wait goes on.
+        """
         assert self._writer is not None and self._reader is not None
 
-        # Untagged replies: anything still buffered would be misread as the
+        # Untagged replies: anything still on the line would be misread as the
         # answer to this query, so start clean.
-        self._buffer.clear()
+        await self._drain_stale()
         self._writer.write(build_read(group, cmd))
         await self._writer.drain()
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + REPLY_TIMEOUT
-        while True:
-            reply = take_reply(self._buffer)
-            if reply is not None:
-                return reply
+        try:
+            while True:
+                reply = take_reply(self._buffer)
+                if reply is not None:
+                    if payload_len is None or not reply.supported or len(reply.payload) == payload_len:
+                        return reply
+                    _LOGGER.debug("Dropped a %d-byte reply to %#04x/%#04x", len(reply.payload), group, cmd)
+                    continue
 
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise TimeoutError(f"no reply to {group:#04x}/{cmd:#04x}")
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError(f"no reply to {group:#04x}/{cmd:#04x}")
 
-            chunk = await asyncio.wait_for(self._reader.read(128), timeout=remaining)
-            if not chunk:
-                raise ConnectionError("bridge closed the connection")
-            self._buffer.extend(chunk)
+                chunk = await asyncio.wait_for(self._reader.read(128), timeout=remaining)
+                if not chunk:
+                    raise ConnectionError("bridge closed the connection")
+                self._buffer.extend(chunk)
+        except TimeoutError:
+            self._line_dirty = True
+            raise
 
     # ------------------------------------------------------------------
     # Decoding
@@ -187,7 +234,8 @@ class ViewSonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _read_control(self, control: Control) -> Any:
         """Read one control. Caller must hold the lock."""
         assert control.read_cmd is not None
-        reply = await self._exchange(control.group, control.read_cmd)
+        single = control.kind in (Kind.SWITCH, Kind.SELECT, Kind.STEP)
+        reply = await self._exchange(control.group, control.read_cmd, SINGLE_BYTE_PAYLOAD if single else None)
         if not reply.supported:
             raise CommandRefused(control.key)
         return self._decode(control, reply.payload)
@@ -357,7 +405,20 @@ class ViewSonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             async with self._lock:
                 await self._connect()
 
-                power = self._apply_power_grace(await self._read_control(POWER))
+                try:
+                    reported = await self._read_control(POWER)
+                except (TimeoutError, CommandRefused) as err:
+                    # The power query always answers when the line is right, so
+                    # a miss or a NAK here is the line, not the projector: keep
+                    # the last state until it happens several times running.
+                    self._power_misses += 1
+                    if self._power_misses >= POWER_MISSES_ALLOWED:
+                        raise
+                    _LOGGER.debug("Power query missed (%s), keeping the last state", type(err).__name__)
+                    return data
+                self._power_misses = 0
+
+                power = self._apply_power_grace(self._debounce_power(reported))
                 data[POWER.key] = power
 
                 if self._last_power is not None and power != self._last_power:
@@ -391,6 +452,17 @@ class ViewSonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(f"Projector at {self.host} not responding: {err}") from err
 
         return data
+
+    def _debounce_power(self, reported: bool) -> bool:
+        """Publish a power change only once two reads in a row agree."""
+        if self._last_power is None or reported == self._last_power:
+            self._power_pending = None
+            return reported
+        if self._power_pending == reported:
+            self._power_pending = None
+            return reported
+        self._power_pending = reported
+        return self._last_power
 
     def _apply_power_grace(self, reported: bool) -> bool:
         """Prefer the commanded power state while the lamp is still changing."""
