@@ -45,6 +45,22 @@ POWER_CONFIRM_SETTLE: Final = 6.0
 # Settle delay before re-reading a plain setting we just wrote.
 WRITE_CONFIRM: Final = 0.4
 
+# Before each query, whatever is already on the line is thrown away: a reply
+# that came after its query timed out would otherwise be read as the answer to
+# the next query. The line counts as quiet after this long without a byte (a
+# 34-byte frame takes 3 ms at 115200 baud).
+STALE_QUIET: Final = 0.03
+# After a query went unanswered its reply may still be on its way: wait longer.
+STALE_QUIET_AFTER_MISS: Final = 0.3
+
+# A missed power reply keeps the last known state; only this many misses in a
+# row mark the projector unavailable.
+POWER_MISSES_ALLOWED: Final = 3
+
+# Controls of these kinds answer with a single byte after three of padding.
+# A wider frame is somebody else's late reply, never theirs.
+SINGLE_BYTE_PAYLOAD: Final = 4
+
 KEY_ERROR_STATUS: Final = "error_status"
 KEY_LAMP_HOURS: Final = "lamp_hours"
 
